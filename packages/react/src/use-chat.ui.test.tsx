@@ -26,7 +26,7 @@ import React, { act, useRef, useState } from 'react';
 import { renderToString } from 'react-dom/server';
 import { Chat } from './chat.react';
 import { setupTestComponent } from './setup-test-component';
-import { useChat } from './use-chat';
+import { useChat, type ChatVitals } from './use-chat';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 function formatChunk(part: UIMessageChunk) {
@@ -4181,6 +4181,156 @@ describe('use-chat', () => {
             ]),
           }),
         );
+      });
+    });
+  });
+  describe('chat vitals', () => {
+    let reports: ChatVitals[] = [];
+    let onReport: (vitals: ChatVitals) => void;
+    let stallThresholdMs: number | undefined;
+    let enabled = true;
+
+    setupTestComponent(() => {
+      const { messages, sendMessage, status } = useChat({
+        id: `vitals-${mockId()()}`,
+        generateId: mockId(),
+        vitals: enabled ? { onReport, stallThresholdMs } : undefined,
+      });
+
+      return (
+        <div>
+          <div data-testid="status">{status.toString()}</div>
+          <div data-testid="messages">{JSON.stringify(messages)}</div>
+          <button
+            data-testid="do-send"
+            onClick={() => {
+              sendMessage({ parts: [{ text: 'hi', type: 'text' }] });
+            }}
+          />
+        </div>
+      );
+    });
+
+    beforeEach(() => {
+      reports = [];
+      enabled = true;
+      stallThresholdMs = undefined;
+      onReport = vitals => {
+        reports.push(vitals);
+      };
+    });
+
+    it('should report time to first visible token and cadence', async () => {
+      server.urls['/api/chat'].response = {
+        type: 'stream-chunks',
+        chunks: [
+          formatChunk({ type: 'text-start', id: '0' }),
+          formatChunk({ type: 'text-delta', id: '0', delta: 'Hello' }),
+          formatChunk({ type: 'text-delta', id: '0', delta: ' world' }),
+          formatChunk({ type: 'text-end', id: '0' }),
+        ],
+      };
+
+      await userEvent.click(screen.getByTestId('do-send'));
+
+      await waitFor(() => {
+        expect(reports).toHaveLength(1);
+      });
+
+      expect(reports[0].status).toBe('ready');
+      expect(reports[0].timeToFirstVisibleTokenMs).toBeGreaterThanOrEqual(0);
+      expect(reports[0].stalls.count).toBe(0);
+      expect(reports[0].longAnimationFrames.count).toBe(0);
+    });
+
+    it('should count gaps above the stall threshold', async () => {
+      stallThresholdMs = 1000;
+      let time = 0;
+      vi.spyOn(performance, 'now').mockImplementation(() => time);
+
+      const controller = new TestResponseController();
+      server.urls['/api/chat'].response = {
+        type: 'controlled-stream',
+        controller,
+      };
+
+      await userEvent.click(screen.getByTestId('do-send'));
+
+      controller.write(formatChunk({ type: 'text-start', id: '0' }));
+      controller.write(
+        formatChunk({ type: 'text-delta', id: '0', delta: 'Hello' }),
+      );
+      await waitFor(() => {
+        expect(screen.getByTestId('messages')).toHaveTextContent('Hello');
+      });
+
+      time = 2500;
+      controller.write(
+        formatChunk({ type: 'text-delta', id: '0', delta: ' world' }),
+      );
+      await waitFor(() => {
+        expect(screen.getByTestId('messages')).toHaveTextContent('Hello world');
+      });
+
+      time = 2600;
+      controller.write(formatChunk({ type: 'text-end', id: '0' }));
+      controller.close();
+
+      await waitFor(() => {
+        expect(reports).toHaveLength(1);
+      });
+
+      expect(reports[0].stalls).toStrictEqual({
+        count: 1,
+        totalMs: 2500,
+        maxMs: 2500,
+      });
+      expect(reports[0].tokenUpdatesPerSecond).toBeCloseTo(0.4);
+    });
+
+    it('should not measure anything when the option is not passed', async () => {
+      enabled = false;
+      const requestFrame = vi.spyOn(globalThis, 'requestAnimationFrame');
+
+      server.urls['/api/chat'].response = {
+        type: 'stream-chunks',
+        chunks: [
+          formatChunk({ type: 'text-start', id: '0' }),
+          formatChunk({ type: 'text-delta', id: '0', delta: 'Hello' }),
+          formatChunk({ type: 'text-end', id: '0' }),
+        ],
+      };
+
+      await userEvent.click(screen.getByTestId('do-send'));
+
+      await waitFor(() => {
+        expect(screen.getByTestId('messages')).toHaveTextContent('Hello');
+        expect(screen.getByTestId('status')).toHaveTextContent('ready');
+      });
+
+      expect(reports).toHaveLength(0);
+      expect(requestFrame).not.toHaveBeenCalled();
+    });
+
+    it('should not break the chat when the report callback throws', async () => {
+      onReport = () => {
+        throw new Error('report failed');
+      };
+
+      server.urls['/api/chat'].response = {
+        type: 'stream-chunks',
+        chunks: [
+          formatChunk({ type: 'text-start', id: '0' }),
+          formatChunk({ type: 'text-delta', id: '0', delta: 'Hello' }),
+          formatChunk({ type: 'text-end', id: '0' }),
+        ],
+      };
+
+      await userEvent.click(screen.getByTestId('do-send'));
+
+      await waitFor(() => {
+        expect(screen.getByTestId('messages')).toHaveTextContent('Hello');
+        expect(screen.getByTestId('status')).toHaveTextContent('ready');
       });
     });
   });

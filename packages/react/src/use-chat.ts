@@ -8,8 +8,14 @@ import {
 } from 'ai';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Chat } from './chat.react';
+import {
+  observeChatVitals,
+  type ChatVitals,
+  type ChatVitalsOptions,
+} from './chat-vitals';
 
 export type { CreateUIMessage, UIMessage };
+export type { ChatVitals, ChatVitalsOptions };
 
 export type UseChatHelpers<UI_MESSAGE extends UIMessage> = {
   /**
@@ -60,6 +66,13 @@ export type UseChatOptions<UI_MESSAGE extends UIMessage> = (
    * Whether to automatically resume an ongoing chat generation stream.
    */
   resume?: boolean;
+
+  /**
+   * Opt in to client-side chat vitals: time to first visible token, token
+   * update cadence, stalls, and long animation frames while a response
+   * streams. Nothing is measured unless this option is passed.
+   */
+  vitals?: ChatVitalsOptions;
 };
 
 type AutomaticResumeState = {
@@ -190,6 +203,7 @@ export function useChat<UI_MESSAGE extends UIMessage = UIMessage>({
   throttle,
   experimental_throttle,
   resume = false,
+  vitals,
   ...options
 }: UseChatOptions<UI_MESSAGE> = {}): UseChatHelpers<UI_MESSAGE> {
   const throttleWaitMs = throttle ?? experimental_throttle;
@@ -322,6 +336,35 @@ export function useChat<UI_MESSAGE extends UIMessage = UIMessage>({
       unsubscribes.forEach(unsubscribe => unsubscribe());
     };
   }, [chat, throttleWaitMs]);
+
+  const vitalsRef = useRef(vitals);
+  vitalsRef.current = vitals;
+  const vitalsEnabled = vitals != null;
+
+  useEffect(() => {
+    if (!vitalsEnabled) {
+      return;
+    }
+
+    return observeChatVitals({
+      chat,
+      getOptions: () => {
+        const current = vitalsRef.current;
+        return current == null
+          ? undefined
+          : {
+              ...current,
+              onReport: report => {
+                try {
+                  vitalsRef.current?.onReport(report);
+                } catch {
+                  // a failing report callback must not affect the chat
+                }
+              },
+            };
+      },
+    });
+  }, [chat, vitalsEnabled]);
 
   const { messages, status, error } = snapshot;
 
